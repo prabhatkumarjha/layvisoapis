@@ -1,47 +1,84 @@
-import { neon } from '@neondatabase/serverless';
+/**
+ * POST /api/delete
+ * Secure soft delete with token + origin validation + activity log
+ */
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+import { sql } from '../lib/db.js';
+import { validateRequest, getCorsHeaders } from '../lib/auth.js';
+
+export const config = { runtime: 'edge' };
+
+export default async function handler(req) {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: getCorsHeaders(req) });
   }
 
+  const authError = validateRequest(req);
+  if (authError) return authError;
+
   try {
-    const { table, id } = req.body;
+    const body = await req.json();
+    const { entity, id, actor } = body;
 
-    // Soft delete config
-    const softDeleteConfig = {
-      users: { field: 'status', value: "'deleted'" },
-      providers: { field: 'is_active', value: false },
-      listings: { field: 'is_active', value: false },
-      bookmarks: { field: 'deleted_at', value: 'NOW()' },
-      reviews: { field: 'status', value: "'deleted'" },
-      system_collections: { field: 'is_active', value: false }
-    };
-
-    if (!softDeleteConfig[table]) {
-      return res.status(400).json({ error: 'Table not deletable' });
+    const allowed = ['cities', 'listings', 'providers', 'reviews', 'bookmarks', 'system_collections', 'users'];
+    if (!allowed.includes(entity)) {
+      return new Response(
+        JSON.stringify({ success: false, error: 'Invalid entity' }),
+        { status: 400, headers: { 'Content-Type': 'application/json', ...getCorsHeaders(req) } }
+      );
     }
 
     if (!id) {
-      return res.status(400).json({ error: 'ID required' });
+      return new Response(
+        JSON.stringify({ success: false, error: 'ID required' }),
+        { status: 400, headers: { 'Content-Type': 'application/json', ...getCorsHeaders(req) } }
+      );
     }
 
-    const sql = neon(process.env.DATABASE_URL);
-    const config = softDeleteConfig[table];
+    // Soft delete based on table type
+    let query;
+    const softDeleteMap = {
+      users: `UPDATE users SET status = 'deleted', updated_at = NOW() WHERE id = $1 RETURNING *`,
+      providers: `UPDATE providers SET is_active = false, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      listings: `UPDATE listings SET is_active = false, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      bookmarks: `UPDATE bookmarks SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *`,
+      reviews: `UPDATE reviews SET status = 'deleted', updated_at = NOW() WHERE id = $1 RETURNING *`,
+      system_collections: `UPDATE system_collections SET is_active = false, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      cities: `UPDATE cities SET status = 'deleted', updated_at = NOW() WHERE id = $1 RETURNING *`
+    };
 
-    const query = `UPDATE ${table} SET ${config.field} = ${config.value}, updated_at = NOW() WHERE id = $1 RETURNING *`;
-    const result = await sql(query, [id]);
+    query = softDeleteMap[entity];
+    const rows = await sql(query, [id]);
 
-    if (result.length === 0) {
-      return res.status(404).json({ error: 'Record not found' });
+    if (rows.length === 0) {
+      return new Response(
+        JSON.stringify({ success: false, error: 'Record not found' }),
+        { status: 404, headers: { 'Content-Type': 'application/json', ...getCorsHeaders(req) } }
+      );
     }
 
-    // Log to activity_logs
-    await sql(`INSERT INTO activity_logs (actor_type, action, entity, entity_id, created_at) VALUES ($1, $2, $3, $4, NOW())`, ['user', 'soft_delete', table, id]);
+    // Activity log
+    if (actor) {
+      const logQuery = `INSERT INTO activity_logs (actor_type, actor_id, actor_email, action, entity, entity_id, payload, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`;
+      await sql(logQuery, [
+        actor.type || 'user',
+        actor.id || null,
+        actor.email || null,
+        'delete',
+        entity,
+        id,
+        JSON.stringify({ soft_delete: true })
+      ]);
+    }
 
-    return res.status(200).json({ success: true, data: result[0] });
-
+    return new Response(
+      JSON.stringify({ success: true, message: 'Deleted successfully', data: rows[0] }),
+      { status: 200, headers: { 'Content-Type': 'application/json', ...getCorsHeaders(req) } }
+    );
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return new Response(
+      JSON.stringify({ success: false, error: err.message }),
+      { status: 500, headers: { 'Content-Type': 'application/json', ...getCorsHeaders(req) } }
+    );
   }
 }
