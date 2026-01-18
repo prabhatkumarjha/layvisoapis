@@ -8,15 +8,18 @@ export default async function handler(req, res) {
   try {
     const { table, id } = req.body;
 
-    // Soft delete tables (set deleted_at)
-    const softDelete = ['bookmarks', 'reviews'];
-    
-    // Hard delete tables
-    const hardDelete = ['listing_views', 'listing_clicks', 'listing_tags', 'user_interests'];
+    // Soft delete config
+    const softDeleteConfig = {
+      users: { field: 'status', value: "'deleted'" },
+      providers: { field: 'is_active', value: false },
+      listings: { field: 'is_active', value: false },
+      bookmarks: { field: 'deleted_at', value: 'NOW()' },
+      reviews: { field: 'status', value: "'deleted'" },
+      system_collections: { field: 'is_active', value: false }
+    };
 
-    const allowed = [...softDelete, ...hardDelete];
-    if (!allowed.includes(table)) {
-      return res.status(400).json({ error: 'Invalid table' });
+    if (!softDeleteConfig[table]) {
+      return res.status(400).json({ error: 'Table not deletable' });
     }
 
     if (!id) {
@@ -24,20 +27,17 @@ export default async function handler(req, res) {
     }
 
     const sql = neon(process.env.DATABASE_URL);
-    let result;
+    const config = softDeleteConfig[table];
 
-    if (softDelete.includes(table)) {
-      result = await sql(`UPDATE ${table} SET deleted_at = NOW() WHERE id = $1 RETURNING *`, [id]);
-    } else {
-      result = await sql(`DELETE FROM ${table} WHERE id = $1 RETURNING *`, [id]);
-    }
+    const query = `UPDATE ${table} SET ${config.field} = ${config.value}, updated_at = NOW() WHERE id = $1 RETURNING *`;
+    const result = await sql(query, [id]);
 
     if (result.length === 0) {
       return res.status(404).json({ error: 'Record not found' });
     }
 
     // Log to activity_logs
-    await sql(`INSERT INTO activity_logs (actor_type, action, entity, entity_id, created_at) VALUES ($1, $2, $3, $4, NOW())`, ['user', 'delete', table, id]);
+    await sql(`INSERT INTO activity_logs (actor_type, action, entity, entity_id, created_at) VALUES ($1, $2, $3, $4, NOW())`, ['user', 'soft_delete', table, id]);
 
     return res.status(200).json({ success: true, data: result[0] });
 
